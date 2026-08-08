@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -37,8 +38,10 @@ MAX_CONCURRENT = int(os.environ.get("CLOAK_MAX_CONCURRENT", "1"))
 DEFAULT_TIMEOUT_MS = int(os.environ.get("CLOAK_DEFAULT_TIMEOUT_MS", "45000"))
 DEFAULT_WAIT_SEC = float(os.environ.get("CLOAK_DEFAULT_WAIT_SEC", "3"))
 PORT = int(os.environ.get("PORT", "8080"))
+REAP_INTERVAL_SEC = float(os.environ.get("CLOAK_REAP_INTERVAL_SEC", "10"))
 
 SEM = asyncio.Semaphore(MAX_CONCURRENT)
+REAPED = 0
 
 
 def _chromium_info() -> dict:
@@ -69,6 +72,7 @@ async def health(_request: web.Request) -> web.Response:
         "cloakbrowser_version": version,
         "max_concurrent": MAX_CONCURRENT,
         "in_flight": MAX_CONCURRENT - SEM._value,
+        "reaped_children": REAPED,
     })
 
 
@@ -189,9 +193,35 @@ def build_app() -> web.Application:
     return app
 
 
+def _reap_children() -> None:
+    """Collect exited Chromium processes so they don't pile up as zombies.
+
+    launch()/close() never wait() on the browser it spawned, and its crashpad
+    helper is re-parented to us when the browser dies. We are PID 1 in the
+    container, so nobody else can reap them: ~24 zombies/day accumulate.
+    Popen.wait() treats an already-collected child as exit 0, so reaping from
+    a side thread does not disturb the library's own bookkeeping.
+    """
+    global REAPED
+    while True:
+        try:
+            while True:
+                pid, _ = os.waitpid(-1, os.WNOHANG)
+                if pid == 0:
+                    break
+                REAPED += 1
+        except ChildProcessError:
+            pass  # no children left — the common case between fetches
+        except Exception:
+            log.exception("reaper failed")
+        time.sleep(REAP_INTERVAL_SEC)
+
+
 def main() -> None:
+    threading.Thread(target=_reap_children, name="reaper", daemon=True).start()
     app = build_app()
-    log.info("cloak-fallback listening on :%d (max_concurrent=%d)", PORT, MAX_CONCURRENT)
+    log.info("cloak-fallback listening on :%d (max_concurrent=%d, reap_every=%.0fs)",
+             PORT, MAX_CONCURRENT, REAP_INTERVAL_SEC)
     web.run_app(app, host="0.0.0.0", port=PORT, access_log=None)
 
 
